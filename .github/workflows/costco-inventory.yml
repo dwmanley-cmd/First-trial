@@ -1,0 +1,74 @@
+name: Costco warehouse inventory check
+
+on:
+  schedule:
+    - cron: "23 13 * * *"   # daily, ~8:23am Eastern / 5:23am Pacific
+  workflow_dispatch:         # "Run workflow" button for a manual check
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      ITEM_NUMBER: ${{ vars.ITEM_NUMBER || '2113717' }}
+      WAREHOUSE_NUMBER: ${{ vars.WAREHOUSE_NUMBER }}
+      ZIP_CODE: ${{ vars.ZIP_CODE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+
+      - name: Check inventory
+        id: check
+        continue-on-error: true
+        run: |
+          python check_inventory.py
+          echo "status=$(jq -r .status result.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### Costco item $ITEM_NUMBER @ warehouse $WAREHOUSE_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat result.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no result" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify when in stock (opens an issue -> GitHub emails you)
+        if: steps.check.outputs.status == 'IN_STOCK'
+        run: |
+          title="Costco item $ITEM_NUMBER is IN STOCK at warehouse $WAREHOUSE_NUMBER"
+          open=$(gh issue list --state open --search "$title in:title" --json number -q '.[0].number')
+          body="Checked $(jq -r .checked_at result.json) via $(jq -r .source result.json).
+
+          Detail: $(jq -r .detail result.json)
+
+          Close this issue after you buy it; a new one opens next time it is back in stock."
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Still in stock as of $(jq -r .checked_at result.json)."
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Save debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inventory-check
+          path: |
+            result.json
+            debug.png
+            debug.html
+          if-no-files-found: ignore
+
+      - name: Fail if status could not be determined
+        if: steps.check.outcome == 'failure'
+        run: exit 1
